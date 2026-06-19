@@ -1,0 +1,225 @@
+version: '3.8'
+
+# ============================================================
+# Docker Compose — Coolify (Instancia Completa)
+# ============================================================
+# Incluye: PostgreSQL + Supabase (Auth/REST/Realtime/Studio)
+#          + MinIO + Frontend Builder + Nginx
+#
+# Para iniciar:
+#   cp .env.coolify .env
+#   docker compose -f docker-compose.coolify.yml up -d
+# ============================================================
+
+services:
+  # ===== PostgreSQL (Supabase-compatible) =====
+  db:
+    image: supabase/postgres:15.8.1.060
+    container_name: chia-db
+    restart: always
+    ports:
+      - '54322:5432'
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./supabase/migrations:/docker-entrypoint-initdb.d/migrations:ro
+      - ./supabase/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - chia-net
+
+  # ===== MinIO — Almacenamiento S3 para adjuntos =====
+  minio:
+    image: minio/minio:latest
+    container_name: chia-minio
+    restart: always
+    command: server /data --console-address ":9001"
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-changeme123}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - chia-net
+
+  # ===== MinIO Init — Crea buckets automaticamente =====
+  minio-init:
+    image: minio/mc:latest
+    container_name: chia-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: |
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-changeme123};
+      mc mb --ignore-existing local/attachments;
+      mc mb --ignore-existing local/reportes;
+      mc version enable local/attachments;
+      mc ilm rule add local/attachments --expire-days 180;
+      mc anonymous set download local/reportes;
+      echo 'MinIO buckets configured';
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-changeme123}
+    networks:
+      - chia-net
+
+  # ===== Supabase Auth (GoTrue) =====
+  auth:
+    image: supabase/gotrue:v2.190.0
+    container_name: chia-auth
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://postgres:${DB_PASSWORD:-postgres}@db:5432/postgres?search_path=auth
+      GOTRUE_SITE_URL: ${SITE_URL:-http://localhost:3000}
+      GOTRUE_JWT_SECRET: ${JWT_SECRET:-super-secret-jwt-token-change-me-in-production}
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: 'true'
+      GOTRUE_MAILER_AUTOCONFIRM: 'true'
+      GOTRUE_SMTP_ADMIN_EMAIL: admin@chia.gov.co
+      GOTRUE_SMTP_HOST: mail
+      GOTRUE_SMTP_PORT: 2500
+      GOTRUE_SMTP_USER: unused
+      GOTRUE_SMTP_PASS: unused
+      GOTRUE_DISABLE_SIGNUP: 'false'
+      GOTRUE_LOG_LEVEL: info
+    networks:
+      - chia-net
+
+  # ===== Supabase REST API (PostgREST) =====
+  rest:
+    image: postgrest/postgrest:v14.2
+    container_name: chia-rest
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: postgres://postgres:${DB_PASSWORD:-postgres}@db:5432/postgres
+      PGRST_DB_SCHEMAS: public,atencion_ciudadana
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_DB_EXTRA_SEARCH_PATH: public,extensions,atencion_ciudadana
+      PGRST_JWT_SECRET: ${JWT_SECRET:-super-secret-jwt-token-change-me-in-production}
+      PGRST_DB_USE_LEGACY_GUCS: 'false'
+    networks:
+      - chia-net
+
+  # ===== Supabase Realtime (WebSockets) =====
+  realtime:
+    image: supabase/realtime:v2.72.0
+    container_name: chia-realtime
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_NAME: postgres
+      DB_SCHEMA: realtime
+      PORT: 4000
+      SECURE_CHANNELS: 'false'
+      JWT_SECRET: ${JWT_SECRET:-super-secret-jwt-token-change-me-in-production}
+      SEARCH_PATH: public,atencion_ciudadana
+    networks:
+      - chia-net
+
+  # ===== Supabase Studio (Dashboard web) =====
+  studio:
+    image: supabase/studio:2026.06.01
+    container_name: chia-studio
+    restart: always
+    environment:
+      SUPABASE_URL: http://rest:3000
+      SUPABASE_PUBLIC_URL: http://localhost:3000
+      STUDIO_PG_META_URL: http://rest:3000/pg
+      SUPABASE_ANON_KEY: ${ANON_KEY:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGmcKQJj4oQ4Q4Q4Q4Q4Q4Q4Q4Q4Q4Q4Q4Q4Q4Q4Q4Q}
+    networks:
+      - chia-net
+
+  # ===== Frontend Builder — Compila el frontend =====
+  frontend-builder:
+    image: node:20-alpine
+    container_name: chia-frontend-builder
+    working_dir: /app
+    entrypoint: |
+      /bin/sh -c "
+      echo 'Instalando dependencias...' &&
+      npm ci --silent --prefer-offline &&
+      echo 'Compilando frontend...' &&
+      npm run build &&
+      echo 'Frontend compilado exitosamente' &&
+      ls -la /app/dist/
+      "
+    environment:
+      VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-http://localhost:3000}
+      VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0}
+      VITE_MINIO_ENDPOINT: ${VITE_MINIO_ENDPOINT:-http://localhost:3000/storage}
+    volumes:
+      - ./frontend:/app
+      - frontend_dist:/app/dist
+      - /app/node_modules
+    networks:
+      - chia-net
+
+  # ===== Nginx — Sirve frontend + proxy unificado =====
+  nginx:
+    image: nginx:alpine
+    container_name: chia-nginx
+    restart: always
+    ports:
+      - '${FRONTEND_PORT:-3000}:80'
+    volumes:
+      - frontend_dist:/usr/share/nginx/html:ro
+      - ./nginx.coolify.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      frontend-builder:
+        condition: service_completed_successfully
+      auth:
+        condition: service_started
+      rest:
+        condition: service_started
+      realtime:
+        condition: service_started
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -f http://localhost:80/health || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - chia-net
+
+volumes:
+  db_data:
+  minio_data:
+  frontend_dist:
+
+networks:
+  chia-net:
+    driver: bridge
